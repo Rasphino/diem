@@ -11,6 +11,7 @@ pub type Errors = Vec<Error>;
 
 pub fn source_map_from_file(file_path: &Path) -> Result<SourceMap> {
     let mut bytes = Vec::new();
+    println!("PATH: {:#?}", file_path);
     File::open(file_path)
         .ok()
         .and_then(|mut file| file.read_to_end(&mut bytes).ok())

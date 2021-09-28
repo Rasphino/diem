@@ -249,7 +249,6 @@ impl ResolvingGraph {
 
         self.unify_addresses_in_package(&package, &mut resolution_table, is_root_package)?;
 
-        let package_path = package_path.canonicalize()?;
         let source_digest =
             ResolvingPackage::get_package_digest_for_config(&package_path, &self.build_options)?;
 
@@ -595,7 +594,6 @@ impl ResolvedPackage {
             .map(Symbol::from)
             .collect())
     }
-
     /// Returns the transitive dependencies of this package in dependency order
     pub fn transitive_dependencies(&self, resolved_graph: &ResolvedGraph) -> Vec<PackageName> {
         let mut seen = BTreeSet::new();

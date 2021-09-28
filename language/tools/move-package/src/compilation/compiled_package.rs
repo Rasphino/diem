@@ -16,6 +16,7 @@ use bytecode_source_map::utils::source_map_from_file;
 use colored::Colorize;
 use docgen::{Docgen, DocgenOptions};
 use move_binary_format::file_format::{CompiledModule, CompiledScript};
+use move_bytecode_utils::Modules;
 use move_command_line_common::files::{
     extension_equals, find_filenames, find_move_filenames, MOVE_COMPILED_EXTENSION,
     SOURCE_MAP_EXTENSION,
@@ -83,26 +84,43 @@ pub struct CompiledPackage {
 /// needed to reconstruct a `CompiledPackage` package from it and to determine whether or not a
 /// recompilation of the package needs to be performed or not.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OnDiskCompiledPackage {
-    /// Path to the root of the package and its data on disk.
-    pub root_path: PathBuf,
+pub struct OnDiskPackage {
     /// Information about the package and the specific compilation that was done.
     pub compiled_package_info: CompiledPackageInfo,
-    /// Paths to dependencies for this package.
-    pub dependencies: Vec<PathBuf>,
+    /// Dependency names for this package.
+    pub dependencies: Vec<FileName>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OnDiskCompiledPackage {
+    /// Path to the root of the package and its data on disk. Relative to/rooted at the directory
+    /// containing the `Move.toml` file for this package.
+    pub root_path: PathBuf,
+    pub package: OnDiskPackage,
 }
 
 impl OnDiskCompiledPackage {
-    pub fn from_path<P: AsRef<Path>>(p: P) -> Result<Self> {
-        let buf = std::fs::read(p)?;
-        let on_disk_package = serde_yaml::from_slice::<Self>(&buf)?;
-        Ok(on_disk_package)
+    pub fn from_path(p: &Path) -> Result<Self> {
+        let (buf, root_path) = if p.exists() && extension_equals(p, "yaml") {
+            (std::fs::read(p)?, p.parent().unwrap().parent().unwrap())
+        } else {
+            (
+                std::fs::read(p.join(CompiledPackageLayout::BuildInfo.path()))?,
+                p.parent().unwrap(),
+            )
+        };
+        let package = serde_yaml::from_slice::<OnDiskPackage>(&buf)?;
+        Ok(Self {
+            root_path: root_path.to_path_buf(),
+            package,
+        })
     }
 
     pub fn into_compiled_package(&self) -> Result<CompiledPackage> {
         let sources = find_move_filenames(
             &[self
                 .root_path
+                .join(self.package.compiled_package_info.package_name.as_str())
                 .join(CompiledPackageLayout::Sources.path())
                 .to_string_lossy()
                 .to_string()],
@@ -112,11 +130,13 @@ impl OnDiskCompiledPackage {
         let source_maps = find_filenames(
             &[self
                 .root_path
+                .join(self.package.compiled_package_info.package_name.as_str())
                 .join(CompiledPackageLayout::SourceMaps.path())
                 .to_string_lossy()
                 .to_string()],
             |path| extension_equals(path, SOURCE_MAP_EXTENSION),
-        )?;
+        )
+        .unwrap_or_else(|_| vec![]);
         assert!(
             compiled_units.len() == source_maps.len(),
             "compiled units and source maps differ"
@@ -165,19 +185,25 @@ impl OnDiskCompiledPackage {
             .collect::<Result<Vec<_>>>()?;
 
         let mut dependencies = Vec::new();
-        let self_path = Path::new(self.compiled_package_info.package_name.as_str());
-        for dep_path in &self.dependencies {
-            if dep_path == self_path {
+        let self_path = self.package.compiled_package_info.package_name;
+        for dep_path in &self.package.dependencies {
+            if dep_path == &self_path {
                 continue;
             }
             dependencies.push(
-                Self::from_path(dep_path.join(CompiledPackageLayout::BuildInfo.path()))?
-                    .into_compiled_package()?,
+                Self::from_path(
+                    &self
+                        .root_path
+                        .join(dep_path.as_str())
+                        .join(CompiledPackageLayout::BuildInfo.path()),
+                )?
+                .into_compiled_package()?,
             )
         }
 
         let docs_path = self
             .root_path
+            .join(self.package.compiled_package_info.package_name.as_str())
             .join(CompiledPackageLayout::CompiledDocs.path());
         let compiled_docs = if docs_path.is_dir() {
             Some(
@@ -197,6 +223,7 @@ impl OnDiskCompiledPackage {
 
         let abi_path = self
             .root_path
+            .join(self.package.compiled_package_info.package_name.as_str())
             .join(CompiledPackageLayout::CompiledABIs.path());
         let compiled_abis = if abi_path.is_dir() {
             Some(
@@ -215,7 +242,7 @@ impl OnDiskCompiledPackage {
         };
 
         Ok(CompiledPackage {
-            compiled_package_info: self.compiled_package_info.clone(),
+            compiled_package_info: self.package.compiled_package_info.clone(),
             sources,
             compiled_units,
             dependencies,
@@ -245,24 +272,26 @@ impl OnDiskCompiledPackage {
         &self,
         resolved_package: &ResolvedPackage,
     ) -> bool {
-        match &self.compiled_package_info.source_digest {
+        match &self.package.compiled_package_info.source_digest {
             // Don't have source available to us
             None => false,
             Some(digest) => digest != &resolved_package.source_digest,
         }
     }
     pub(crate) fn are_build_flags_different(&self, build_config: &BuildConfig) -> bool {
-        build_config != &self.compiled_package_info.build_flags
+        build_config != &self.package.compiled_package_info.build_flags
     }
 
     fn get_compiled_units_paths(&self) -> Result<Vec<String>> {
         let mut compiled_unit_paths = vec![self
             .root_path
+            .join(self.package.compiled_package_info.package_name.as_str())
             .join(CompiledPackageLayout::CompiledModules.path())
             .to_string_lossy()
             .to_string()];
         let compiled_scripts_path = self
             .root_path
+            .join(self.package.compiled_package_info.package_name.as_str())
             .join(CompiledPackageLayout::CompiledScripts.path());
         if compiled_scripts_path.exists() {
             compiled_unit_paths.push(compiled_scripts_path.to_string_lossy().to_string());
@@ -275,23 +304,28 @@ impl OnDiskCompiledPackage {
 
 impl CompiledPackage {
     /// Returns all compiled modules for this package in transitive dependencies
-    pub fn transitive_compiled_modules(&self) -> Vec<CompiledUnit> {
+    pub fn transitive_compiled_units(&self) -> Vec<CompiledUnit> {
         self.transitive_dependencies()
-            .into_iter()
+            .iter()
             .flat_map(|compiled_package| compiled_package.compiled_units.clone())
             .collect()
     }
 
-    /// Returns `CompiledPackage`s in dependency order
-    pub fn transitive_dependencies(&self) -> Vec<&CompiledPackage> {
-        self.dependencies
-            .iter()
-            .flat_map(|dep| {
-                let mut dep_deps = dep.transitive_dependencies();
-                dep_deps.push(dep);
-                dep_deps
-            })
-            .collect()
+    pub fn transitive_compiled_modules(&self) -> Modules {
+        Modules::new(
+            self.transitive_dependencies()
+                .iter()
+                .flat_map(|compiled_package| &compiled_package.compiled_units)
+                .filter_map(|unit| match unit {
+                    CompiledUnit::Module(NamedCompiledModule { module, .. }) => Some(module),
+                    CompiledUnit::Script(_) => None,
+                }),
+        )
+    }
+
+    /// Returns `CompiledPackage`s in dependency order and deduped
+    pub fn transitive_dependencies(&self) -> &[CompiledPackage] {
+        &self.dependencies
     }
 
     pub(crate) fn build<W: Write>(
@@ -328,13 +362,16 @@ impl CompiledPackage {
 
         // Compare the digest of the package being compiled against the digest of the package at the time
         // of the last compilation to determine if we can reuse the already-compiled package or not.
-        if let Ok(package) = OnDiskCompiledPackage::from_path(path) {
+        if let Ok(package) = OnDiskCompiledPackage::from_path(&path) {
             if !package.has_source_changed_since_last_compile(&resolved_package)
                 && !package.are_build_flags_different(&resolution_graph.build_options)
             {
                 // Need to dive deeper to make sure that instantiations haven't changed since that
                 // can be changed by other packages above us in the dependency graph possibly
-                if package.compiled_package_info.address_alias_instantiation
+                if package
+                    .package
+                    .compiled_package_info
+                    .address_alias_instantiation
                     == resolved_package.resolution_table
                 {
                     return package.into_compiled_package();
@@ -424,7 +461,13 @@ impl CompiledPackage {
             )?;
 
             if resolution_graph.build_options.generate_docs {
-                compiled_docs = Some(Self::build_docs(&model, project_root, &dependencies));
+                compiled_docs = Some(Self::build_docs(
+                    resolved_package.source_package.package.name,
+                    &model,
+                    &resolved_package.package_path,
+                    &dependencies,
+                    &resolution_graph.build_options.install_dir,
+                ));
             }
 
             if resolution_graph.build_options.generate_abis {
@@ -455,16 +498,23 @@ impl CompiledPackage {
     pub(crate) fn save_to_disk(&self, under_path: PathBuf) -> Result<OnDiskCompiledPackage> {
         let on_disk_package = OnDiskCompiledPackage {
             root_path: under_path.join(&self.compiled_package_info.package_name.to_string()),
-            compiled_package_info: self.compiled_package_info.clone(),
-            dependencies: self
-                .dependencies
-                .iter()
-                .map(|dep| under_path.join(dep.compiled_package_info.package_name.as_str()))
-                .collect(),
+            package: OnDiskPackage {
+                compiled_package_info: self.compiled_package_info.clone(),
+                dependencies: self
+                    .dependencies
+                    .iter()
+                    .map(|dep| dep.compiled_package_info.package_name)
+                    .collect(),
+            },
         };
 
         std::fs::create_dir_all(&on_disk_package.root_path)?;
 
+        std::fs::create_dir_all(
+            on_disk_package
+                .root_path
+                .join(CompiledPackageLayout::Sources.path()),
+        )?;
         for source_path in &self.sources {
             on_disk_package.save_under(
                 CompiledPackageLayout::Sources.path(),
@@ -473,6 +523,16 @@ impl CompiledPackage {
             )?;
         }
 
+        std::fs::create_dir_all(
+            on_disk_package
+                .root_path
+                .join(CompiledPackageLayout::CompiledScripts.path()),
+        )?;
+        std::fs::create_dir_all(
+            on_disk_package
+                .root_path
+                .join(CompiledPackageLayout::CompiledModules.path()),
+        )?;
         for compiled_unit in &self.compiled_units {
             let under_path = match &compiled_unit {
                 CompiledUnit::Script(_) => CompiledPackageLayout::CompiledScripts.path(),
@@ -518,7 +578,7 @@ impl CompiledPackage {
         on_disk_package.save_under(
             CompiledPackageLayout::BuildInfo.path(),
             None,
-            serde_yaml::to_string(&on_disk_package)?.as_bytes(),
+            serde_yaml::to_string(&on_disk_package.package)?.as_bytes(),
         )?;
 
         Ok(on_disk_package)
@@ -572,32 +632,43 @@ impl CompiledPackage {
     }
 
     fn build_docs(
+        package_name: PackageName,
         model: &GlobalEnv,
-        project_root: &Path,
+        package_root: &Path,
         deps: &[CompiledPackage],
+        install_dir: &Option<PathBuf>,
     ) -> Vec<(String, String)> {
         let root_doc_templates = find_filenames(
-            &[project_root
+            &[package_root
                 .join(SourcePackageLayout::DocTemplates.path())
                 .to_string_lossy()
                 .to_string()],
             |path| extension_equals(path, "md"),
         )
-        .unwrap();
+        .unwrap_or_else(|_| vec![]);
+        let root_for_docs = if let Some(install_dir) = install_dir {
+            install_dir.join(CompiledPackageLayout::Root.path())
+        } else {
+            CompiledPackageLayout::Root.path().to_path_buf()
+        };
+        let dep_paths = deps
+            .iter()
+            .map(|dep| {
+                root_for_docs
+                    .join(dep.compiled_package_info.package_name.as_str())
+                    .join(CompiledPackageLayout::CompiledDocs.path())
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+        let in_pkg_doc_path = root_for_docs
+            .join(package_name.as_str())
+            .join(CompiledPackageLayout::CompiledDocs.path());
         let doc_options = DocgenOptions {
-            doc_path: deps
-                .iter()
-                .map(|dep| {
-                    project_root
-                        .join(CompiledPackageLayout::Root.path())
-                        .join(dep.compiled_package_info.package_name.as_str())
-                        .join(CompiledPackageLayout::CompiledDocs.path())
-                        .to_string_lossy()
-                        .to_string()
-                })
-                .collect(),
-            output_directory: "".to_string(),
+            doc_path: dep_paths,
+            output_directory: in_pkg_doc_path.to_string_lossy().to_string(),
             root_doc_templates,
+            compile_relative_to: true,
             ..DocgenOptions::default()
         };
         let docgen = Docgen::new(model, &doc_options);
